@@ -1,16 +1,52 @@
 #!/bin/bash
-APP="https://github.com/bautt/s4cshow/raw/main/splunk4champions2.tar.gz"
-TMPFILE="/tmp/splunk4champions2.tar.gz"
+
+APP1="https://github.com/bautt/s4cshow/raw/main/splunk4champions2.tar.gz"
+APP2="https://github.com/bautt/s4cshow/raw/main/phyphox.tar.gz"
+
+TMPFILE1="/tmp/splunk4champions2.tar.gz"
+TMPFILE2="/tmp/phyphox.tar.gz"
+
 INDEXES="https://raw.githubusercontent.com/bautt/s4cshow/main/indexes.conf"
 INPUTS="https://raw.githubusercontent.com/bautt/s4cshow/main/inputs.conf"
-#get app from github
-/usr/bin/wget -q $APP -O $TMPFILE
-# unpack it directly to Splunk etc apps
-/usr/bin/tar zxf $TMPFILE --directory /opt/splunk/etc/apps
-# create indexes
-mkdir -p /opt/splunk/etc/apps/splunk4champions2/local
-wget -q $INDEXES  -O /opt/splunk/etc/apps/splunk4champions2/local/indexes.conf
-#enable inputs for local files in static 
-wget -q $INPUTS -O /opt/splunk/etc/apps/splunk4champions2/local/inputs.conf
-#restart splunk
-/opt/splunk/bin/splunk restart
+
+LOGFILE="/var/log/s4c.log"
+
+log() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOGFILE
+}
+
+install_app() {
+    local app_url=$1
+    local tmp_file=$2
+
+    log "Downloading app from $app_url."
+    if /usr/bin/wget -q $app_url -O $tmp_file; then
+        log "Successfully downloaded $tmp_file."
+        if /usr/bin/tar zxf $tmp_file --directory /opt/splunk/etc/apps; then
+            log "Successfully extracted $tmp_file."
+        else
+            log "Failed to extract $tmp_file."
+        fi
+    else
+        log "Failed to download $app_url."
+    fi
+}
+
+# Install apps
+install_app $APP1 $TMPFILE1
+install_app $APP2 $TMPFILE2
+
+# Create indexes
+log "Setting up index and input configurations."
+mkdir -p /opt/splunk/etc/apps/splunk4champions2/local && \
+wget -q $INDEXES -O /opt/splunk/etc/apps/splunk4champions2/local/indexes.conf && \
+wget -q $INPUTS -O /opt/splunk/etc/apps/splunk4champions2/local/inputs.conf && \
+log "Configuration files set up successfully."
+
+# Restart Splunk
+log "Restarting Splunk."
+if /opt/splunk/bin/splunk restart; then
+    log "Splunk restarted successfully."
+else
+    log "Failed to restart Splunk."
+fi
