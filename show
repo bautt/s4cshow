@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 APP1="https://github.com/bautt/s4cshow/raw/main/splunk4champions2.tar.gz"
 APP2="https://github.com/bautt/s4cshow/raw/main/phyphox.tar.gz"
@@ -12,36 +13,48 @@ INPUTS="https://raw.githubusercontent.com/bautt/s4cshow/main/inputs.conf"
 LOGFILE="/var/log/s4c.log"
 
 log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOGFILE
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
 }
 
-install_app() {
-    local app_url=$1
-    local tmp_file=$2
+cleanup() {
+    rm -f "$TMPFILE1" "$TMPFILE2"
+}
+trap cleanup EXIT
 
-    log "Downloading app from $app_url."
-    if /usr/bin/wget -q $app_url -O $tmp_file; then
-        log "Successfully downloaded $tmp_file."
-        if /usr/bin/tar zxf $tmp_file --directory /opt/splunk/etc/apps; then
-            log "Successfully extracted $tmp_file."
+install_app() {
+    local app_url="$1"
+    local tmp_file="$2"
+
+    log "Downloading app from ${app_url}."
+    if /usr/bin/wget --no-verbose "$app_url" -O "$tmp_file"; then
+        log "Successfully downloaded ${tmp_file}."
+        if /usr/bin/tar zxf "$tmp_file" --directory /opt/splunk/etc/apps; then
+            log "Successfully extracted ${tmp_file}."
         else
-            log "Failed to extract $tmp_file."
+            log "Failed to extract ${tmp_file}."
+            return 1
         fi
     else
-        log "Failed to download $app_url."
+        log "Failed to download ${app_url}."
+        return 1
     fi
 }
 
 # Install apps
-install_app $APP1 $TMPFILE1
-install_app $APP2 $TMPFILE2
+install_app "$APP1" "$TMPFILE1"
+install_app "$APP2" "$TMPFILE2"
 
-# Create indexes
+# Deploy index and input configurations to local/ (overrides app defaults)
 log "Setting up index and input configurations."
-mkdir -p /opt/splunk/etc/apps/splunk4champions2/local && \
-wget -q $INDEXES -O /opt/splunk/etc/apps/splunk4champions2/local/indexes.conf && \
-wget -q $INPUTS -O /opt/splunk/etc/apps/splunk4champions2/local/inputs.conf && \
-log "Configuration files set up successfully."
+mkdir -p /opt/splunk/etc/apps/splunk4champions2/local
+
+if /usr/bin/wget --no-verbose "$INDEXES" -O /opt/splunk/etc/apps/splunk4champions2/local/indexes.conf && \
+   /usr/bin/wget --no-verbose "$INPUTS"  -O /opt/splunk/etc/apps/splunk4champions2/local/inputs.conf; then
+    log "Configuration files set up successfully."
+else
+    log "Failed to download configuration files."
+    exit 1
+fi
 
 # Restart Splunk
 log "Restarting Splunk."
@@ -49,4 +62,5 @@ if /opt/splunk/bin/splunk restart; then
     log "Splunk restarted successfully."
 else
     log "Failed to restart Splunk."
+    exit 1
 fi
