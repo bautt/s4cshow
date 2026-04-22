@@ -1,5 +1,6 @@
 #!/bin/bash
-set -euo pipefail
+# s4cshow install script — safe for cron
+# Failures are logged to syslog + file; script continues past non-fatal errors.
 
 APP1="https://github.com/bautt/s4cshow/raw/main/splunk4champions2.tar.gz"
 APP2="https://github.com/bautt/s4cshow/raw/main/phyphox.tar.gz"
@@ -11,56 +12,139 @@ INDEXES="https://raw.githubusercontent.com/bautt/s4cshow/main/indexes.conf"
 INPUTS="https://raw.githubusercontent.com/bautt/s4cshow/main/inputs.conf"
 
 LOGFILE="/var/log/s4c.log"
+LOCKFILE="/tmp/s4cshow.lock"
+WGET_TIMEOUT=60   # seconds per download attempt
+ERRORS=0
+
+# ---------------------------------------------------------------------------
+# Logging — file + syslog
+# ---------------------------------------------------------------------------
 
 log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOGFILE"
+    local msg="s4cshow: $1"
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"
+    logger -t s4cshow "$1"
 }
 
+log_error() {
+    ERRORS=$((ERRORS + 1))
+    log "ERROR: $1"
+}
+
+# ---------------------------------------------------------------------------
+# Lock — prevent concurrent cron runs
+# ---------------------------------------------------------------------------
+
+if [ -e "$LOCKFILE" ]; then
+    pid=$(cat "$LOCKFILE" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+        log "Already running (pid $pid), exiting."
+        exit 0
+    else
+        log "Stale lock found (pid $pid), removing."
+        rm -f "$LOCKFILE"
+    fi
+fi
+
+echo $$ > "$LOCKFILE"
+
 cleanup() {
-    rm -f "$TMPFILE1" "$TMPFILE2"
+    rm -f "$TMPFILE1" "$TMPFILE2" "$LOCKFILE"
 }
 trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Install app — download + extract + fix ownership
+# ---------------------------------------------------------------------------
 
 install_app() {
     local app_url="$1"
     local tmp_file="$2"
+    local app_dir="$3"   # expected directory name under /opt/splunk/etc/apps
 
-    log "Downloading app from ${app_url}."
-    if /usr/bin/wget --no-verbose "$app_url" -O "$tmp_file"; then
-        log "Successfully downloaded ${tmp_file}."
-        if /usr/bin/tar zxf "$tmp_file" --directory /opt/splunk/etc/apps; then
-            log "Successfully extracted ${tmp_file}."
-        else
-            log "Failed to extract ${tmp_file}."
-            return 1
-        fi
+    log "Downloading $app_url"
+    if /usr/bin/wget --no-verbose --timeout="$WGET_TIMEOUT" --tries=2 \
+            "$app_url" -O "$tmp_file" 2>>"$LOGFILE"; then
+        log "Downloaded $tmp_file"
     else
-        log "Failed to download ${app_url}."
+        log_error "Failed to download $app_url — skipping"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if /usr/bin/tar zxf "$tmp_file" --directory /opt/splunk/etc/apps 2>>"$LOGFILE"; then
+        log "Extracted $tmp_file"
+        chown -R splunk:splunk "/opt/splunk/etc/apps/${app_dir}" 2>/dev/null || \
+            log_error "chown failed for ${app_dir}"
+    else
+        log_error "Failed to extract $tmp_file — skipping"
         return 1
     fi
 }
 
-# Install apps
-install_app "$APP1" "$TMPFILE1"
-install_app "$APP2" "$TMPFILE2"
+# ---------------------------------------------------------------------------
+# Deploy index + input configs
+# ---------------------------------------------------------------------------
 
-# Deploy index and input configurations to local/ (overrides app defaults)
-log "Setting up index and input configurations."
-mkdir -p /opt/splunk/etc/apps/splunk4champions2/local
+deploy_configs() {
+    local target_dir="/opt/splunk/etc/apps/splunk4champions2/local"
+    mkdir -p "$target_dir"
 
-if /usr/bin/wget --no-verbose "$INDEXES" -O /opt/splunk/etc/apps/splunk4champions2/local/indexes.conf && \
-   /usr/bin/wget --no-verbose "$INPUTS"  -O /opt/splunk/etc/apps/splunk4champions2/local/inputs.conf; then
-    log "Configuration files set up successfully."
+    local ok=0
+
+    log "Downloading indexes.conf"
+    if /usr/bin/wget --no-verbose --timeout="$WGET_TIMEOUT" --tries=2 \
+            "$INDEXES" -O "$target_dir/indexes.conf" 2>>"$LOGFILE"; then
+        log "indexes.conf deployed"
+    else
+        log_error "Failed to download indexes.conf"
+        ok=1
+    fi
+
+    log "Downloading inputs.conf"
+    if /usr/bin/wget --no-verbose --timeout="$WGET_TIMEOUT" --tries=2 \
+            "$INPUTS" -O "$target_dir/inputs.conf" 2>>"$LOGFILE"; then
+        log "inputs.conf deployed"
+    else
+        log_error "Failed to download inputs.conf"
+        ok=1
+    fi
+
+    chown -R splunk:splunk "$target_dir" 2>/dev/null || \
+        log_error "chown failed for $target_dir"
+    return $ok
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+log "Starting s4cshow install (pid $$)"
+
+install_app "$APP1" "$TMPFILE1" "splunk4champions2" || true
+install_app "$APP2" "$TMPFILE2" "phyphox"          || true
+
+deploy_configs || true
+
+# Final ownership sweep — ensures nothing was left as root after extraction
+log "Fixing ownership on /opt/splunk/etc/apps"
+if chown -R splunk:splunk /opt/splunk/etc/apps 2>>"$LOGFILE"; then
+    log "Ownership set: splunk:splunk on /opt/splunk/etc/apps"
 else
-    log "Failed to download configuration files."
-    exit 1
+    log_error "chown -R on /opt/splunk/etc/apps failed"
 fi
 
-# Restart Splunk
-log "Restarting Splunk."
-if /opt/splunk/bin/splunk restart; then
-    log "Splunk restarted successfully."
+log "Restarting Splunk"
+if systemctl restart Splunkd 2>>"$LOGFILE"; then
+    log "Splunk restarted successfully"
 else
-    log "Failed to restart Splunk."
+    log_error "Splunk restart failed"
+fi
+
+if [ "$ERRORS" -gt 0 ]; then
+    log "Completed with $ERRORS error(s) — check log above"
     exit 1
+else
+    log "Completed successfully"
+    exit 0
 fi
